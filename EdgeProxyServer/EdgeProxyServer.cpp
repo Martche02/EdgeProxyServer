@@ -11,6 +11,7 @@
 #include <sstream>
 #include <ctime>
 #include <iomanip>
+#include <filesystem>
 
 namespace {
   std::mutex g_logMutex;
@@ -247,10 +248,47 @@ void CompletionHandler::HandleRequest(const httplib::Request& req, httplib::Resp
 // 5. MAIN COM SUPER DEBUGGER E GATEWAY
 // ==========================================
 
-int main()
+int main(int argc, char* argv[])
 {
   try
   {
+    // 1) Parse simple command-line args to allow: --api-Key <key>  --model <model>  --port <port>  --no-copilot
+    bool launchCopilot = true;
+    std::string apiKeyArg;
+    std::string modelArg;
+    int portOverride = -1;
+
+    for (int i = 1; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--api-Key" || a == "--apiKey") {
+        if (i + 1 < argc) apiKeyArg = argv[++i];
+      }
+      else if (a == "--model" || a == "--target-model") {
+        if (i + 1 < argc) modelArg = argv[++i];
+      }
+      else if (a == "--port") {
+        if (i + 1 < argc) portOverride = std::stoi(argv[++i]);
+      }
+      else if (a == "--no-copilot") {
+        launchCopilot = false;
+      }
+      else if (a == "--help" || a == "-h") {
+        std::cout << "Usage: EdgeProxyServer.exe --api-Key <KEY> [--model <MODEL>] [--port <PORT>] [--no-copilot]\n";
+        return 0;
+      }
+    }
+
+    // 2) If provided via CLI, export the env vars so LoadFromEnvironment() works as before
+    if (!apiKeyArg.empty()) {
+      _putenv_s("OPENAI_API_KEY", apiKeyArg.c_str());
+    }
+    if (!modelArg.empty()) {
+      _putenv_s("TARGET_MODEL", modelArg.c_str());
+    }
+    if (portOverride > 0) {
+      _putenv_s("PROXY_PORT", std::to_string(portOverride).c_str());
+    }
+
     Config config;
     config.LoadFromEnvironment();
 
@@ -307,9 +345,6 @@ int main()
       // SANITIZAÇÃO BRUTA: Aplica máscara em todo o JSON, ignorando a estrutura
       if (req.method == "POST" && !body.empty()) {
         body = sanitizer.SanitizeString(body);
-
-        // REMOVIDO: A forçação de "stream: false" que quebrava o CLI.
-        // Agora respeitamos o que o CLI pediu (SSE Stream).
 
         std::cout << "     [->] Payload (RAW) mascarado com sucesso.\n";
       }
@@ -398,10 +433,65 @@ int main()
     }
     Logger::Info("Log de trafego Copilot em: " + proxyLogPath);
 
-    if (!svr.listen("0.0.0.0", config.GetPort())) {
-      Logger::Error("Falha ao abrir a porta " + std::to_string(config.GetPort()));
-      return 1;
+    // Start server in background thread so we can also launch Copilot in a new console window
+    std::thread serverThread([&svr, &config]() {
+      if (!svr.listen("0.0.0.0", config.GetPort())) {
+        Logger::Error("Falha ao abrir a porta " + std::to_string(config.GetPort()));
+        // If server can't start, exit the process to avoid orphaned Copilot
+        std::exit(1);
+      }
+    });
+
+    // Wait until the local server responds on /ping (with timeout) before launching Copilot.
+    {
+      httplib::Client localCli("127.0.0.1", config.GetPort());
+      const int timeoutSeconds = 10;
+      bool ok = false;
+      for (int i = 0; i < timeoutSeconds * 5; ++i) { // check every 200ms
+        try {
+          auto r = localCli.Get("/ping");
+          if (r && r->status == 200) { ok = true; break; }
+        }
+        catch (...) { /* ignore and retry */ }
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      }
+      if (!ok) {
+        Logger::Error("Aviso: servidor nao respondeu em " + std::to_string(timeoutSeconds) + "s; ainda assim procedendo ao lancamento do Copilot.");
+      }
     }
+
+    if (launchCopilot) {
+      // Start Copilot in the repository root (so project context/instructions are found).
+      std::filesystem::path launchPath = std::filesystem::current_path();
+      {
+        std::filesystem::path probe = launchPath;
+        for (int i = 0; i < 5; ++i) {
+          if (std::filesystem::exists(probe / "HowToRun.md") || std::filesystem::exists(probe / "EdgeProxyServer.slnx")) {
+            launchPath = probe;
+            break;
+          }
+          if (!probe.has_parent_path()) break;
+          probe = probe.parent_path();
+        }
+      }
+      std::string cwd = launchPath.string();
+      for (auto& c : cwd) if (c == '/') c = '\\';
+
+      // Keep proxy for Copilot API traffic, but bypass proxy for GitHub auth hosts.
+      // Important: use comma-separated NO_PROXY entries (what Node tooling expects).
+      std::ostringstream cmd;
+      cmd << "start \"Copilot\" cmd /K \"cd /d \"" << cwd
+          << "\" && set NO_PROXY=api.github.com,github.com,githubusercontent.com,telemetry.individual.githubcopilot.com,api.individual.githubcopilot.com"
+          << " && set HTTPS_PROXY=http://127.0.0.1:" << config.GetPort()
+          << " && copilot\"";
+
+      std::string scmd = cmd.str();
+      std::system(scmd.c_str());
+      Logger::Info("Copilot iniciado em nova janela interativa (cwd=" + cwd + ") com HTTPS_PROXY=127.0.0.1:" + std::to_string(config.GetPort()) + " e NO_PROXY para auth GitHub.");
+    }
+
+    // Wait for the server thread to finish (blocking)
+    serverThread.join();
   }
   catch (const std::exception& e)
   {
