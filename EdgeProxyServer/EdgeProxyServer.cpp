@@ -12,6 +12,8 @@
 #include <ctime>
 #include <iomanip>
 #include <filesystem>
+#include <vector>
+#include <windows.h>
 
 namespace {
   std::mutex g_logMutex;
@@ -254,6 +256,7 @@ int main(int argc, char* argv[])
   {
     // 1) Parse simple command-line args to allow: --api-Key <key>  --model <model>  --port <port>  --no-copilot
     bool launchCopilot = true;
+    bool proxyOnly = false;
     std::string apiKeyArg;
     std::string modelArg;
     int portOverride = -1;
@@ -272,8 +275,11 @@ int main(int argc, char* argv[])
       else if (a == "--no-copilot") {
         launchCopilot = false;
       }
+      else if (a == "--proxy-only") {
+        proxyOnly = true;
+      }
       else if (a == "--help" || a == "-h") {
-        std::cout << "Usage: EdgeProxyServer.exe --api-Key <KEY> [--model <MODEL>] [--port <PORT>] [--no-copilot]\n";
+        std::cout << "Usage: EdgeProxyServer.exe --api-Key <KEY> [--model <MODEL>] [--port <PORT>] [--no-copilot] [--proxy-only]\n";
         return 0;
       }
     }
@@ -291,6 +297,82 @@ int main(int argc, char* argv[])
 
     Config config;
     config.LoadFromEnvironment();
+
+    auto findRepoRoot = []() -> std::filesystem::path {
+      std::filesystem::path probe = std::filesystem::current_path();
+      for (int i = 0; i < 5; ++i) {
+        if (std::filesystem::exists(probe / "HowToRun.md") || std::filesystem::exists(probe / "EdgeProxyServer.slnx")) {
+          return probe;
+        }
+        if (!probe.has_parent_path()) break;
+        probe = probe.parent_path();
+      }
+      return std::filesystem::current_path();
+      };
+
+    // Default UX: keep Copilot in the current terminal and move proxy to an auxiliary terminal.
+    if (launchCopilot && !proxyOnly) {
+      std::filesystem::path exePath = std::filesystem::absolute(argv[0]);
+      std::string exe = exePath.string();
+      for (auto& c : exe) if (c == '/') c = '\\';
+
+      std::ostringstream proxyCmd;
+      proxyCmd << "\"" << exe << "\" --proxy-only --no-copilot --port " << config.GetPort();
+      if (!config.GetTargetModel().empty()) {
+        proxyCmd << " --model \"" << config.GetTargetModel() << "\"";
+      }
+      std::string proxyCmdLine = proxyCmd.str();
+      std::vector<char> proxyCmdMutable(proxyCmdLine.begin(), proxyCmdLine.end());
+      proxyCmdMutable.push_back('\0');
+
+      STARTUPINFOA si{};
+      si.cb = sizeof(si);
+      si.dwFlags = STARTF_USESHOWWINDOW;
+      si.wShowWindow = SW_HIDE;
+
+      PROCESS_INFORMATION pi{};
+      if (!CreateProcessA(
+        nullptr,
+        proxyCmdMutable.data(),
+        nullptr,
+        nullptr,
+        FALSE,
+        CREATE_NO_WINDOW | DETACHED_PROCESS,
+        nullptr,
+        nullptr,
+        &si,
+        &pi))
+      {
+        Logger::Error("Falha ao iniciar proxy oculto. Erro Win32: " + std::to_string(GetLastError()));
+        return 1;
+      }
+
+      CloseHandle(pi.hThread);
+      CloseHandle(pi.hProcess);
+
+      // Wait for auxiliary proxy readiness.
+      httplib::Client localCli("127.0.0.1", config.GetPort());
+      const int timeoutSeconds = 10;
+      bool ok = false;
+      for (int i = 0; i < timeoutSeconds * 5; ++i) {
+        try {
+          auto r = localCli.Get("/ping");
+          if (r && r->status == 200) { ok = true; break; }
+        }
+        catch (...) { /* ignore and retry */ }
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      }
+      if (!ok) {
+        Logger::Error("Proxy auxiliar nao respondeu em " + std::to_string(timeoutSeconds) + "s.");
+        return 1;
+      }
+
+      std::filesystem::current_path(findRepoRoot());
+      _putenv_s("NO_PROXY", "api.github.com,github.com,githubusercontent.com,telemetry.individual.githubcopilot.com,api.individual.githubcopilot.com");
+      _putenv_s("HTTPS_PROXY", ("http://127.0.0.1:" + std::to_string(config.GetPort())).c_str());
+      Logger::Info("Proxy iniciado em background oculto. Iniciando Copilot no terminal atual...");
+      return std::system("copilot");
+    }
 
     IpVault vault;
     vault.LoadFromFile(config.GetVaultPath());
@@ -458,36 +540,6 @@ int main(int argc, char* argv[])
       if (!ok) {
         Logger::Error("Aviso: servidor nao respondeu em " + std::to_string(timeoutSeconds) + "s; ainda assim procedendo ao lancamento do Copilot.");
       }
-    }
-
-    if (launchCopilot) {
-      // Start Copilot in the repository root (so project context/instructions are found).
-      std::filesystem::path launchPath = std::filesystem::current_path();
-      {
-        std::filesystem::path probe = launchPath;
-        for (int i = 0; i < 5; ++i) {
-          if (std::filesystem::exists(probe / "HowToRun.md") || std::filesystem::exists(probe / "EdgeProxyServer.slnx")) {
-            launchPath = probe;
-            break;
-          }
-          if (!probe.has_parent_path()) break;
-          probe = probe.parent_path();
-        }
-      }
-      std::string cwd = launchPath.string();
-      for (auto& c : cwd) if (c == '/') c = '\\';
-
-      // Keep proxy for Copilot API traffic, but bypass proxy for GitHub auth hosts.
-      // Important: use comma-separated NO_PROXY entries (what Node tooling expects).
-      std::ostringstream cmd;
-      cmd << "start \"Copilot\" cmd /K \"cd /d \"" << cwd
-          << "\" && set NO_PROXY=api.github.com,github.com,githubusercontent.com,telemetry.individual.githubcopilot.com,api.individual.githubcopilot.com"
-          << " && set HTTPS_PROXY=http://127.0.0.1:" << config.GetPort()
-          << " && copilot\"";
-
-      std::string scmd = cmd.str();
-      std::system(scmd.c_str());
-      Logger::Info("Copilot iniciado em nova janela interativa (cwd=" + cwd + ") com HTTPS_PROXY=127.0.0.1:" + std::to_string(config.GetPort()) + " e NO_PROXY para auth GitHub.");
     }
 
     // Wait for the server thread to finish (blocking)

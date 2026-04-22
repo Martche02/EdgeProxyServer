@@ -11,9 +11,10 @@ EdgeProxyServer.exe --api-Key <SUA_API_KEY>
 Com isso, o app:
 
 1. Sobe o proxy local.
-2. Configura `HTTPS_PROXY` para o Copilot automaticamente.
-3. Abre o Copilot CLI em nova janela.
-4. Aplica `NO_PROXY` para hosts de autenticação GitHub (evita erros de auth por `CONNECT`), mantendo o tráfego de conteúdo no proxy.
+2. Sobe o proxy em **background oculto** (sem abrir janela extra).
+3. Configura `HTTPS_PROXY` para o Copilot automaticamente.
+4. Inicia o Copilot CLI no **mesmo terminal** em que você executou o comando.
+5. Aplica `NO_PROXY` para hosts de autenticação GitHub (evita erros de auth por `CONNECT`), mantendo o tráfego de conteúdo no proxy.
 
 ## Opções úteis
 
