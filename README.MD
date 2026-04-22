@@ -27,7 +27,7 @@ It masks sensitive terms in outgoing requests, forwards the request to the confi
 
 - `OPENAI_API_KEY` (**required**) - bearer token used for upstream calls
 - `PROXY_PORT` (optional, default: `8080`) - local listen port
-- `TARGET_MODEL` (optional, default: `gpt-4o`) - model injected for chat completion payloads
+- `TARGET_MODEL` (optional, no default) - if set, forcibly injects/overrides the model in chat completion payloads; if unset, proxy keeps the model chosen by the Copilot client
 
 Vault path:
 
@@ -65,7 +65,8 @@ PowerShell example (runtime variables):
 ```powershell
 $env:OPENAI_API_KEY = "your_token_here"
 $env:PROXY_PORT = "8080"
-$env:TARGET_MODEL = "gpt-4o"
+# Optional: uncomment to force all requests to one model
+# $env:TARGET_MODEL = "gpt-4o"
 ```
 
 Then verify:

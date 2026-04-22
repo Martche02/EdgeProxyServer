@@ -7,6 +7,79 @@
 #include <algorithm>
 #include <thread>
 #include <chrono>
+#include <mutex>
+#include <sstream>
+#include <ctime>
+#include <iomanip>
+
+namespace {
+  std::mutex g_logMutex;
+
+  std::string func_token33(std::string value)
+  {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return value;
+  }
+
+  bool func_token34(const std::string& headerNameLower)
+  {
+    // Hop-by-hop or reconstructed headers that should not be forwarded manually.
+    return headerNameLower == "host" ||
+      headerNameLower == "content-length" ||
+      headerNameLower == "accept-encoding" ||
+      headerNameLower == "transfer-encoding" ||
+      headerNameLower == "connection";
+  }
+
+  bool func_token35(const std::string& headerNameLower)
+  {
+    // Security/protocol-sensitive headers: keep values untouched.
+    return headerNameLower == "authorization" ||
+      headerNameLower == "proxy-authorization" ||
+      headerNameLower == "cookie" ||
+      headerNameLower == "set-cookie" ||
+      headerNameLower == "content-type" ||
+      headerNameLower == "content-length" ||
+      headerNameLower == "content-encoding" ||
+      headerNameLower == "transfer-encoding" ||
+      headerNameLower == "accept" ||
+      headerNameLower == "accept-encoding" ||
+      headerNameLower == "user-agent";
+  }
+
+  std::string func_token30()
+  {
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t nowTime = std::chrono::system_clock::to_time_t(now);
+    std::tm localTm{};
+    localtime_s(&localTm, &nowTime);
+    std::ostringstream oss;
+    oss << std::put_time(&localTm, "%Y-%m-%d %H:%M:%S");
+    return oss.str();
+  }
+
+  std::string func_token31()
+  {
+    const char* envLogPath = std::getenv("PROXY_LOG_PATH");
+    if (envLogPath && *envLogPath) return envLogPath;
+
+    const char* tempDir = std::getenv("TEMP");
+    return tempDir ? std::string(tempDir) + "\\copilot_proxy_traffic.log" : "C:\\Temp\\copilot_proxy_traffic.log";
+  }
+
+  void func_token32(const std::string& section, const std::string& method, const std::string& path, const std::string& content)
+  {
+    std::lock_guard<std::mutex> lock(g_logMutex);
+    std::ofstream out(func_token31(), std::ios::app);
+    if (!out.is_open()) return;
+
+    out << "===== [" << func_token30() << "] " << section << " =====\n";
+    out << "METHOD: " << method << "\n";
+    out << "PATH: " << path << "\n";
+    out << "CONTENT:\n";
+    out << (content.empty() ? "<empty>" : content) << "\n\n";
+  }
+}
 
 // ==========================================
 // 1. UTILITÁRIOS E CONFIGURAÇÃO
@@ -29,7 +102,7 @@ void Config::LoadFromEnvironment()
   _vaultPath = tempDir ? std::string(tempDir) + "\\ip_vault_map.json" : "C:\\Temp\\ip_vault_map.json";
 
   const char* envModel = std::getenv("TARGET_MODEL");
-  _targetModel = envModel ? envModel : "gpt-4o";
+  _targetModel = (envModel && *envModel) ? envModel : "";
 }
 
 // ==========================================
@@ -89,7 +162,10 @@ std::string Sanitizer::RestoreString(const std::string& text) const
 
 void Sanitizer::SanitizeJsonPayload(nlohmann::json& payload, const std::string& targetModel) const
 {
-  payload["model"] = targetModel;
+  if (!targetModel.empty()) {
+    // Optional override: only enforce model if TARGET_MODEL was explicitly configured.
+    payload["model"] = targetModel;
+  }
   payload["stream"] = false;
 
   if (payload.contains("messages") && payload["messages"].is_array())
@@ -186,6 +262,7 @@ int main()
 
     OpenAiClient llmClient(config.GetApiKey());
     CompletionHandler handler(sanitizer, llmClient, config.GetTargetModel());
+    const std::string proxyLogPath = func_token31();
 
     httplib::Server svr;
 
@@ -215,10 +292,13 @@ int main()
       // Copia os headers, removendo interferências
       httplib::Headers headers;
       for (const auto& h : req.headers) {
-        std::string key = h.first;
-        std::transform(key.begin(), key.end(), key.begin(), ::tolower);
-        if (key != "host" && key != "content-length" && key != "accept-encoding") {
-          headers.emplace(h.first, h.second);
+        const std::string keyLower = func_token33(h.first);
+        if (!func_token34(keyLower)) {
+          std::string value = h.second;
+          if (!func_token35(keyLower)) {
+            value = sanitizer.SanitizeString(value);
+          }
+          headers.emplace(h.first, value);
         }
       }
 
@@ -234,6 +314,8 @@ int main()
         std::cout << "     [->] Payload (RAW) mascarado com sucesso.\n";
       }
 
+      func_token32("OUTBOUND TO COPILOT", req.method, req.path, body);
+
       auto process_response = [&](auto& apiRes) {
         if (apiRes) {
           std::cout << "     [<-] Status da Nuvem: HTTP " << apiRes->status << "\n";
@@ -244,6 +326,8 @@ int main()
           res.status = apiRes->status;
           std::string res_body = apiRes->body;
 
+          func_token32("INBOUND FROM COPILOT", req.method, req.path, res_body);
+
           // RESTAURAÇÃO BRUTA
           if (!res_body.empty()) {
             res_body = sanitizer.RestoreString(res_body);
@@ -251,12 +335,15 @@ int main()
 
           // DEVOLVE OS HEADERS ORIGINAIS PARA O CLI!
           for (auto& h : apiRes->headers) {
-            std::string key = h.first;
-            std::transform(key.begin(), key.end(), key.begin(), ::tolower);
+            const std::string keyLower = func_token33(h.first);
 
             // REMOVIDO "content-type" daqui para não duplicar com o res.set_content e crashar o Node.js do CLI
-            if (key != "content-encoding" && key != "content-length" && key != "transfer-encoding" && key != "content-type") {
-              res.set_header(h.first, h.second);
+            if (!func_token34(keyLower) && keyLower != "content-type") {
+              std::string value = h.second;
+              if (!func_token35(keyLower)) {
+                value = sanitizer.RestoreString(value);
+              }
+              res.set_header(h.first, value);
             }
           }
 
@@ -303,6 +390,13 @@ int main()
       });
 
     Logger::Info("Proxy SUPER DEBUG pronto na porta " + std::to_string(config.GetPort()));
+    if (config.GetTargetModel().empty()) {
+      Logger::Info("TARGET_MODEL nao definido: proxy nao sobrescreve o modelo enviado pelo cliente.");
+    }
+    else {
+      Logger::Info("TARGET_MODEL definido: forcar modelo '" + config.GetTargetModel() + "'.");
+    }
+    Logger::Info("Log de trafego Copilot em: " + proxyLogPath);
 
     if (!svr.listen("0.0.0.0", config.GetPort())) {
       Logger::Error("Falha ao abrir a porta " + std::to_string(config.GetPort()));
